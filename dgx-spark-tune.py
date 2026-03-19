@@ -61,13 +61,16 @@ def dim(t: str) -> str:
 # ---------------------------------------------------------------------------
 # Shell helpers
 # ---------------------------------------------------------------------------
-def run(cmd: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: str, *, check: bool = False, timeout: int | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         shell=True,
         capture_output=True,
         text=True,
         check=check,
+        timeout=timeout,
     )
 
 
@@ -945,46 +948,66 @@ INFERENCE_TUNE_SERVICE = "/etc/systemd/system/inference-tune.service"
 
 
 def _bench_kernel_source() -> str:
-    """Generate the CUDA benchmark kernel source code."""
+    """Generate a sustained cuBLAS tensor core benchmark.
+
+    Runs 4-stream FP16->FP32 GEMM continuously for a given number of seconds,
+    reports sustained TFLOPS and iteration count. Uses N=4096 which is large
+    enough to saturate the GPU.
+    """
     lines = [
         "#include <cstdio>",
         "#include <cstdlib>",
         "#include <cuda_runtime.h>",
-        "#include <algorithm>",
-        "#include <numeric>",
-        "#include <vector>",
-        "#define N 1024",
-        "#define BLOCK 16",
-        "#define ITERS 1000",
-        "static void check(cudaError_t e, int line) {",
-        '    if (e != cudaSuccess) { fprintf(stderr, "CUDA error line %d: %s\\n", line, cudaGetErrorString(e)); exit(1); }',
-        "}",
-        "#define CHECK(c) check((c), __LINE__)",
-        "__global__ void matmul(const float*A, const float*B, float*C, int n) {",
-        "    int r=blockIdx.y*blockDim.y+threadIdx.y, c=blockIdx.x*blockDim.x+threadIdx.x;",
-        "    if (r<n && c<n) { float s=0; for(int k=0;k<n;++k) s+=A[r*n+k]*B[k*n+c]; C[r*n+c]=s; }",
-        "}",
-        "int main() {",
-        "    size_t bytes = N*N*sizeof(float);",
-        "    float *hA=(float*)malloc(bytes), *hB=(float*)malloc(bytes);",
-        "    srand(42); for(int i=0;i<N*N;i++){hA[i]=(rand()%100)/100.f; hB[i]=(rand()%100)/100.f;}",
-        "    float *dA, *dB, *dC;",
-        "    CHECK(cudaMalloc(&dA,bytes)); CHECK(cudaMalloc(&dB,bytes)); CHECK(cudaMalloc(&dC,bytes));",
-        "    CHECK(cudaMemcpy(dA,hA,bytes,cudaMemcpyHostToDevice)); CHECK(cudaMemcpy(dB,hB,bytes,cudaMemcpyHostToDevice));",
-        "    dim3 t(BLOCK,BLOCK), b((N+BLOCK-1)/BLOCK,(N+BLOCK-1)/BLOCK);",
-        "    for(int i=0;i<10;i++){matmul<<<b,t>>>(dA,dB,dC,N);} CHECK(cudaDeviceSynchronize());",
-        "    std::vector<float> times(ITERS);",
-        "    for(int i=0;i<ITERS;i++){",
-        "        cudaEvent_t s,e; CHECK(cudaEventCreate(&s)); CHECK(cudaEventCreate(&e));",
-        "        CHECK(cudaEventRecord(s)); matmul<<<b,t>>>(dA,dB,dC,N); CHECK(cudaEventRecord(e));",
-        "        CHECK(cudaEventSynchronize(e)); CHECK(cudaEventElapsedTime(&times[i],s,e));",
-        "        CHECK(cudaEventDestroy(s)); CHECK(cudaEventDestroy(e));",
+        "#include <cuda_fp16.h>",
+        "#include <cublas_v2.h>",
+        "#include <chrono>",
+        "static void chk(cudaError_t e,int l){if(e!=cudaSuccess){fprintf(stderr,",
+        '  "CUDA %d: %s\\n",l,cudaGetErrorString(e));exit(1);}}',
+        "#define CHECK(c) chk((c),__LINE__)",
+        "int main(int argc, char**argv){",
+        "    int SECS=argc>1?atoi(argv[1]):15;",
+        "    const int N=4096, NBUF=4;",
+        "    size_t bh=(size_t)N*N*sizeof(half), bf=(size_t)N*N*sizeof(float);",
+        "    half*dA[4],*dB[4]; float*dC[4];",
+        "    half*h=(half*)malloc(bh);",
+        "    for(long i=0;i<(long)N*N;i++) h[i]=__float2half((i%100)/100.0f);",
+        "    for(int b=0;b<NBUF;b++){",
+        "        CHECK(cudaMalloc(&dA[b],bh)); CHECK(cudaMalloc(&dB[b],bh));",
+        "        CHECK(cudaMalloc(&dC[b],bf));",
+        "        CHECK(cudaMemcpy(dA[b],h,bh,cudaMemcpyHostToDevice));",
+        "        CHECK(cudaMemcpy(dB[b],h,bh,cudaMemcpyHostToDevice));",
         "    }",
-        "    std::sort(times.begin(),times.end());",
-        "    float sum=std::accumulate(times.begin(),times.end(),0.0f);",
-        "    float avg=sum/ITERS, p50=times[ITERS/2], p95=times[(int)(ITERS*0.95)], p99=times[(int)(ITERS*0.99)];",
-        '    printf("%.4f %.4f %.4f %.4f %.4f %.4f\\n", avg, p50, p95, p99, times[0], times[ITERS-1]);',
-        "    free(hA); free(hB); cudaFree(dA); cudaFree(dB); cudaFree(dC);",
+        "    free(h);",
+        "    cublasHandle_t handle; cublasCreate(&handle);",
+        "    cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);",
+        "    float alpha=1.0f, beta=0.0f;",
+        "    cudaStream_t st[4];",
+        "    for(int b=0;b<NBUF;b++) CHECK(cudaStreamCreate(&st[b]));",
+        "    for(int i=0;i<10;i++){int b=i%NBUF; cublasSetStream(handle,st[b]);",
+        "        cublasGemmEx(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,N,N,&alpha,",
+        "            dA[b],CUDA_R_16F,N,dB[b],CUDA_R_16F,N,&beta,",
+        "            dC[b],CUDA_R_32F,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP);",
+        "    }",
+        "    CHECK(cudaDeviceSynchronize());",
+        "    auto t0=std::chrono::high_resolution_clock::now();",
+        "    long iters=0; double elapsed=0;",
+        "    while(elapsed<SECS){",
+        "        for(int b=0;b<NBUF;b++){cublasSetStream(handle,st[b]);",
+        "            cublasGemmEx(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,N,N,&alpha,",
+        "                dA[b],CUDA_R_16F,N,dB[b],CUDA_R_16F,N,&beta,",
+        "                dC[b],CUDA_R_32F,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP);",
+        "            iters++;",
+        "        }",
+        "        CHECK(cudaDeviceSynchronize());",
+        "        auto t1=std::chrono::high_resolution_clock::now();",
+        "        elapsed=std::chrono::duration<double>(t1-t0).count();",
+        "    }",
+        "    double ms_per=(elapsed*1000.0)/iters;",
+        "    double tflops=2.0*(double)N*N*N/(ms_per*1e9);",
+        '    printf("%.2f %.4f %ld %.1f\\n", tflops, ms_per, iters, elapsed);',
+        "    for(int b=0;b<NBUF;b++){cudaStreamDestroy(st[b]);",
+        "        cudaFree(dA[b]);cudaFree(dB[b]);cudaFree(dC[b]);}",
+        "    cublasDestroy(handle);",
         "}",
     ]
     return "\n".join(lines) + "\n"
@@ -993,20 +1016,10 @@ def _bench_kernel_source() -> str:
 @dataclass
 class BenchResult:
     mhz: int
-    avg_ms: float
-    p50_ms: float
-    p95_ms: float
-    p99_ms: float
-    min_ms: float
-    max_ms: float
-
-    @property
-    def gflops(self) -> float:
-        return 2.0 * 1024**3 / (self.avg_ms * 1e6)
-
-    @property
-    def jitter_ms(self) -> float:
-        return self.max_ms - self.min_ms
+    tflops: float
+    ms_per_iter: float
+    iters: int
+    gpu_power_w: float
 
 
 def _get_gpu_clock_range() -> tuple[int, int] | None:
@@ -1028,37 +1041,64 @@ def _get_gpu_clock_range() -> tuple[int, int] | None:
     return (min_clk, max_clk) if max_clk > 0 else None
 
 
+def _detect_gpu_arch() -> str:
+    """Detect the GPU SM architecture for nvcc."""
+    r = run("nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits")
+    if r.returncode == 0 and r.stdout.strip():
+        cap = r.stdout.strip().replace(".", "")
+        return f"sm_{cap}"
+    return "sm_121"
+
+
 def _compile_bench(nvcc: str, tmpdir: str) -> str | None:
-    """Compile the benchmark kernel, return binary path or None."""
+    """Compile the sustained cuBLAS benchmark, return binary path or None."""
     src = Path(tmpdir) / "autotune.cu"
     out = Path(tmpdir) / "autotune"
     src.write_text(_bench_kernel_source())
-    r = run(f"{nvcc} -arch=sm_121 -O3 -o {out} {src}")
+    arch = _detect_gpu_arch()
+    r = run(f"{nvcc} -arch={arch} -O3 -o {out} {src} -lcublas")
     if r.returncode != 0:
         print(red(f"  nvcc error: {r.stderr.strip()[-300:]}"))
         return None
-    # Verify binary exists and is executable
     if not Path(out).exists():
         print(red(f"  Binary not created at {out}"))
         return None
     return str(out)
 
 
-def _run_bench(binary: str, mhz: int) -> BenchResult | None:
-    """Lock clocks, run benchmark, parse result. mhz=0 means DVFS auto."""
+def _read_gpu_power() -> float:
+    """Read current GPU power in watts."""
+    r = run("nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits")
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            return float(r.stdout.strip())
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _run_bench(binary: str, mhz: int, secs: int = 15) -> BenchResult | None:
+    """Lock clocks, run sustained benchmark, sample power mid-run.
+
+    mhz=0 means DVFS auto.
+    """
     if mhz > 0:
         run(f"nvidia-smi -lgc {mhz},{mhz}")
-    time.sleep(0.5)  # settle after clock change
-    r = run(binary)
+    else:
+        run("nvidia-smi -rgc")
+    time.sleep(1)  # settle after clock change
+    r = run(f"{binary} {secs}", timeout=secs + 30)
     if r.returncode != 0:
         return None
     parts = r.stdout.strip().split()
-    if len(parts) != 6:
+    if len(parts) != 4:
         return None
-    avg, p50, p95, p99, mn, mx = (float(x) for x in parts)
-    return BenchResult(
-        mhz=mhz, avg_ms=avg, p50_ms=p50, p95_ms=p95, p99_ms=p99, min_ms=mn, max_ms=mx
-    )
+    tflops = float(parts[0])
+    ms_per = float(parts[1])
+    iters = int(parts[2])
+    # Read power right after (GPU is still warm)
+    power = _read_gpu_power()
+    return BenchResult(mhz=mhz, tflops=tflops, ms_per_iter=ms_per, iters=iters, gpu_power_w=power)
 
 
 def _get_current_locked_clock() -> int | None:
@@ -1133,10 +1173,10 @@ def _write_inference_tune_service(gpu_clock_mhz: int | None = None) -> None:
 
 
 def autotune_gpu_clock(apply: bool = False) -> None:
-    """Sweep GPU clock speeds and find optimal frequency."""
-    print(bold("\n  GPU Clock Autotune (1000-iter matmul benchmark)\n"))
+    """Sweep GPU clock speeds with sustained cuBLAS tensor core load."""
+    print(bold("\n  GPU Clock Autotune (sustained cuBLAS tensor core, 15s per freq)\n"))
 
-    # Find nvcc
+    # Find nvcc + cublas
     nvcc_path = "/usr/local/cuda/bin/nvcc"
     r = run(f"{nvcc_path} --version")
     if r.returncode != 0:
@@ -1151,54 +1191,52 @@ def autotune_gpu_clock(apply: bool = False) -> None:
 
     _, max_clk = clk_range
 
-    # Single tempdir for compilation — reused for sweep + DVFS baseline
     with tempfile.TemporaryDirectory(prefix="gpu-autotune-") as tmpdir:
-        print("  Compiling benchmark kernel...")
+        print("  Compiling sustained cuBLAS benchmark...")
         binary = _compile_bench(nvcc_path, tmpdir)
         if not binary:
             print(red("  Compilation failed — skipping autotune."))
             return
 
-        # Determine sweep range: 100 MHz steps from max-500 to max
-        step = 100
-        # Below ~1500 MHz is power-saving territory, not useful for inference
-        sweep_start = max(1500, max_clk - 500)
-        sweep_start = (sweep_start // step) * step
+        # Sweep range: 200 MHz steps from 1500 to max
+        step = 200
+        sweep_start = max(1500, ((max_clk - 1000) // step) * step)
         freqs = list(range(sweep_start, max_clk + 1, step))
         if max_clk not in freqs:
             freqs.append(max_clk)
 
+        est_min = len(freqs) * 15 // 60 + 1
         print(f"  Sweeping {len(freqs)} frequencies: {freqs[0]}-{freqs[-1]} MHz ({step} MHz steps)")
-        print(f"  {len(freqs) * 1000} total iterations (~{len(freqs) * 2} min)\n")
+        print(f"  15s sustained per frequency (~{est_min} min total)\n")
 
         results: list[BenchResult] = []
-        hdr = f"    {'MHz':>5s}  {'avg ms':>8s}  {'GFLOPS':>7s}  {'p50':>8s}  {'p95':>8s}  {'p99':>8s}  {'jitter':>7s}"
+        hdr = f"    {'MHz':>5s}  {'TFLOPS':>8s}  {'ms/iter':>8s}  {'iters':>7s}  {'GPU W':>7s}  {'TF/W':>6s}"
         print(dim(hdr))
 
         for mhz in freqs:
-            br = _run_bench(binary, mhz)
+            br = _run_bench(binary, mhz, secs=15)
             if br is None:
                 print(f"    {mhz:5d}  FAILED")
                 continue
             results.append(br)
+            tf_per_w = br.tflops / br.gpu_power_w if br.gpu_power_w > 0 else 0
             line = (
-                f"    {br.mhz:5d}  {br.avg_ms:8.3f}  {br.gflops:7.0f}  "
-                f"{br.p50_ms:8.3f}  {br.p95_ms:8.3f}  {br.p99_ms:8.3f}  {br.jitter_ms:7.3f}"
+                f"    {br.mhz:5d}  {br.tflops:8.1f}  {br.ms_per_iter:8.2f}  "
+                f"{br.iters:7d}  {br.gpu_power_w:7.1f}  {tf_per_w:6.2f}"
             )
             print(line)
 
-        # DVFS auto — no warmup, to capture cold-start ramp-up cost
-        run("nvidia-smi -rgc")
-        time.sleep(2)  # let GPU settle back to idle
+        # DVFS auto baseline
         print()
-        print("  Running DVFS auto baseline (cold start)...")
-        auto_br = _run_bench(binary, 0)  # 0 = DVFS auto, no clock lock
-        run("nvidia-smi -rgc")  # ensure reset
+        print("  Running DVFS auto baseline (15s sustained)...")
+        auto_br = _run_bench(binary, 0, secs=15)
+        run("nvidia-smi -rgc")
         if auto_br:
             auto_br.mhz = 0
+            tf_per_w = auto_br.tflops / auto_br.gpu_power_w if auto_br.gpu_power_w > 0 else 0
             line = (
-                f"    {'auto':>5s}  {auto_br.avg_ms:8.3f}  {auto_br.gflops:7.0f}  "
-                f"{auto_br.p50_ms:8.3f}  {auto_br.p95_ms:8.3f}  {auto_br.p99_ms:8.3f}  {auto_br.jitter_ms:7.3f}"
+                f"    {'auto':>5s}  {auto_br.tflops:8.1f}  {auto_br.ms_per_iter:8.2f}  "
+                f"{auto_br.iters:7d}  {auto_br.gpu_power_w:7.1f}  {tf_per_w:6.2f}"
             )
             print(line)
             results.append(auto_br)
@@ -1208,50 +1246,70 @@ def autotune_gpu_clock(apply: bool = False) -> None:
         run("nvidia-smi -rgc")
         return
 
-    # Pick winner: best avg GFLOPS, break ties by lowest p99
-    best = min(results, key=lambda r: (r.avg_ms, r.p99_ms))
-    # Also find best p99 for latency-sensitive recommendation
-    best_p99 = min(results, key=lambda r: (r.p99_ms, r.avg_ms))
-
-    print()
-    if best.mhz == 0:
-        print(green(f"  Best throughput: DVFS auto — {best.gflops:.0f} GFLOPS avg"))
-    else:
-        print(green(f"  Best throughput: {best.mhz} MHz — {best.gflops:.0f} GFLOPS avg"))
-    if best_p99.mhz != best.mhz:
-        label = "DVFS auto" if best_p99.mhz == 0 else f"{best_p99.mhz} MHz"
-        print(f"  Best tail latency: {label} — p99 {best_p99.p99_ms:.3f} ms")
+    # Pick winner: best sustained TFLOPS
+    best = max(results, key=lambda r: r.tflops)
+    # Also find best efficiency (TFLOPS/watt)
+    best_eff = max(
+        (r for r in results if r.gpu_power_w > 0),
+        key=lambda r: r.tflops / r.gpu_power_w,
+        default=best,
+    )
 
     # Reset clocks before deciding
     run("nvidia-smi -rgc")
 
+    print()
+    label_best = "DVFS auto" if best.mhz == 0 else f"{best.mhz} MHz"
+    print(green(f"  Best throughput: {label_best} — {best.tflops:.1f} TFLOPS sustained"))
+    if best_eff.mhz != best.mhz:
+        eff = best_eff.tflops / best_eff.gpu_power_w if best_eff.gpu_power_w > 0 else 0
+        label_eff = "DVFS auto" if best_eff.mhz == 0 else f"{best_eff.mhz} MHz"
+        print(
+            f"  Best efficiency: {label_eff} — {eff:.2f} TFLOPS/W ({best_eff.tflops:.1f} TF @ {best_eff.gpu_power_w:.0f}W)"
+        )
+
+    # Use best efficiency if it's within 5% of peak throughput (save power)
+    recommend = best
+    if best_eff.gpu_power_w > 0 and best.gpu_power_w > 0:
+        if best_eff.tflops >= best.tflops * 0.95:
+            recommend = best_eff
+        elif best_eff.tflops >= best.tflops * 0.90:
+            # Within 10% — mention but still pick throughput
+            label_eff = "DVFS auto" if best_eff.mhz == 0 else f"{best_eff.mhz} MHz"
+            eff_w = best.gpu_power_w - best_eff.gpu_power_w
+            if eff_w > 5:
+                print(
+                    dim(
+                        f"    ({label_eff} saves {eff_w:.0f}W for {(1 - best_eff.tflops / best.tflops) * 100:.0f}% less throughput)"
+                    )
+                )
+
     # If DVFS auto wins, recommend no lock
-    if best.mhz == 0:
+    if recommend.mhz == 0:
         current = _get_current_locked_clock()
         if current:
-            print(yellow(f"\n  DVFS auto is optimal. Currently locked at {current} MHz."))
+            print(yellow(f"\n  Recommendation: DVFS auto. Currently locked at {current} MHz."))
             if apply or ask("Remove clock lock and use DVFS auto?"):
                 Path(AUTOTUNE_CONF).unlink(missing_ok=True)
                 run("nvidia-smi -rgc")
-                # Rewrite service without GPU clock, keeping CPU idle tuning
                 _write_inference_tune_service(gpu_clock_mhz=None)
-                print(green("  Clock lock removed. Using DVFS auto. CPU idle tuning preserved."))
+                print(green("  Clock lock removed. Using DVFS auto."))
         else:
-            print(green("\n  DVFS auto is already optimal. No clock lock needed."))
+            print(green("\n  Recommendation: DVFS auto (already active)."))
         return
 
     # Recommend locking
     current = _get_current_locked_clock()
-    if current == best.mhz:
-        print(green(f"\n  Already locked at optimal {best.mhz} MHz."))
+    if current == recommend.mhz:
+        print(green(f"\n  Already locked at optimal {recommend.mhz} MHz."))
         return
 
     print()
-    if apply or ask(f"Lock GPU clock to {best.mhz} MHz and persist across reboots?"):
-        _persist_clock(best.mhz)
-        print(green(f"  GPU clock locked to {best.mhz} MHz."))
+    if apply or ask(f"Lock GPU clock to {recommend.mhz} MHz and persist across reboots?"):
+        _persist_clock(recommend.mhz)
+        print(green(f"  GPU clock locked to {recommend.mhz} MHz."))
         print(dim(f"    Config: {AUTOTUNE_CONF}"))
-        print(dim(f"    Service: {AUTOTUNE_SERVICE} (enabled)"))
+        print(dim(f"    Service: {INFERENCE_TUNE_SERVICE} (enabled)"))
     else:
         print(dim("  Skipped."))
 
